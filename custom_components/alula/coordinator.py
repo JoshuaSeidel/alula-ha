@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import json
 import logging
 from typing import Any
 
@@ -37,12 +38,18 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.config_entry = config_entry
+        self._probed = False
 
     # ──────────────────────────────────────────────────────────────────
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Alula API."""
         try:
+            # One-time API probe to discover available endpoints/structure
+            if not self._probed:
+                await self._async_probe_api()
+                self._probed = True
+
             devices = await self.client.async_get_devices()
 
             _LOGGER.debug("API returned %d devices", len(devices))
@@ -68,15 +75,12 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if devices and not panels:
                 _LOGGER.warning(
-                    "Found %d devices but none are panels. "
-                    "Device types: %s",
+                    "Found %d devices but none are panels. Device types: %s",
                     len(devices),
                     [d.device_type for d in devices],
                 )
 
-            # Fetch zones per panel via the device relationship endpoint
-            # which returns ALL zones (not just notification-enabled ones).
-            # Falls back to the notification zones endpoint if it fails.
+            # Fetch zones – tries device endpoint, falls back to notifications
             zones = await self._async_fetch_zones(list(panels.keys()))
 
             # Group zones by device_id -> zone_index
@@ -102,6 +106,96 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"Authentication error: {err}") from err
         except (AlulaApiError, AlulaConnectionError) as err:
             raise UpdateFailed(f"API error: {err}") from err
+
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _async_probe_api(self) -> None:
+        """One-time probe to log API structure for debugging."""
+        _LOGGER.warning("=== ALULA API PROBE (one-time) ===")
+
+        # 1) Fetch a device WITH relationships to see what links exist
+        try:
+            raw = await self.client.async_request_raw(
+                "GET", "/api/v1/devices",
+                params={"page[size]": "1"},
+            )
+            if raw.get("data"):
+                first = raw["data"][0] if isinstance(raw["data"], list) else raw["data"]
+                _LOGGER.warning(
+                    "PROBE device top-level keys: %s", list(first.keys())
+                )
+                if "relationships" in first:
+                    _LOGGER.warning(
+                        "PROBE device relationships: %s",
+                        json.dumps(first["relationships"], indent=2, default=str),
+                    )
+                if "attributes" in first:
+                    _LOGGER.warning(
+                        "PROBE device attribute keys: %s",
+                        list(first["attributes"].keys()),
+                    )
+                device_id = first.get("id", "")
+            else:
+                _LOGGER.warning("PROBE: /api/v1/devices returned no data")
+                return
+        except Exception as err:
+            _LOGGER.warning("PROBE devices failed: %s", err)
+            return
+
+        # 2) Try several zone endpoint patterns
+        zone_paths = [
+            f"/api/v1/devices/{device_id}/zones",
+            f"/api/v1/devices/{device_id}/device-zones",
+            f"/api/v1/device-zones",
+            f"/api/v1/zones",
+        ]
+        for path in zone_paths:
+            try:
+                raw = await self.client.async_request_raw(
+                    "GET", path,
+                    params={"page[size]": "5"},
+                )
+                data = raw.get("data", [])
+                count = len(data) if isinstance(data, list) else (1 if data else 0)
+                _LOGGER.warning("PROBE %s => %d items", path, count)
+                if data:
+                    first_zone = data[0] if isinstance(data, list) else data
+                    _LOGGER.warning(
+                        "PROBE %s first item keys: %s", path, list(first_zone.keys())
+                    )
+                    if "attributes" in first_zone:
+                        _LOGGER.warning(
+                            "PROBE %s attribute keys: %s",
+                            path,
+                            list(first_zone["attributes"].keys()),
+                        )
+                        _LOGGER.warning(
+                            "PROBE %s first item attributes: %s",
+                            path,
+                            json.dumps(first_zone["attributes"], indent=2, default=str),
+                        )
+                    break  # Found a working endpoint
+            except Exception as err:
+                _LOGGER.warning("PROBE %s => FAILED: %s", path, err)
+
+        # 3) Log the notification zones endpoint structure too
+        try:
+            raw = await self.client.async_request_raw(
+                "GET", "/api/v1/events/notifications/zones",
+                params={"page[size]": "5"},
+            )
+            data = raw.get("data", [])
+            count = len(data) if isinstance(data, list) else 0
+            _LOGGER.warning("PROBE /api/v1/events/notifications/zones => %d items", count)
+            if data:
+                _LOGGER.warning(
+                    "PROBE notification zone attribute keys: %s",
+                    list(data[0].get("attributes", {}).keys()),
+                )
+        except Exception as err:
+            _LOGGER.warning("PROBE notification zones => FAILED: %s", err)
+
+        _LOGGER.warning("=== END ALULA API PROBE ===")
 
     # ──────────────────────────────────────────────────────────────────
 
