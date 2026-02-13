@@ -80,8 +80,13 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     [d.device_type for d in devices],
                 )
 
-            # Fetch zones – tries device endpoint, falls back to notifications
-            zones = await self._async_fetch_zones(list(panels.keys()))
+            # Fetch zones via the notification endpoint (only source available)
+            try:
+                await self.client.async_renew_notifications()
+            except (AlulaApiError, AlulaConnectionError) as err:
+                _LOGGER.warning("Failed to renew notifications: %s", err)
+
+            zones = await self.client.async_get_zones()
 
             # Group zones by device_id -> zone_index
             zone_map: dict[str, dict[int, Zone]] = {}
@@ -111,130 +116,95 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_probe_api(self) -> None:
         """One-time probe to log API structure for debugging."""
-        # Access the client's internal _request to make raw API calls
-        # without needing a newer alulapy version.
         raw_request = self.client._request  # noqa: SLF001
 
         _LOGGER.warning("=== ALULA API PROBE (one-time) ===")
 
-        # 1) Fetch a device WITH relationships to see what links exist
+        # 1) Fetch device with relationships
         try:
             raw = await raw_request(
                 "GET", "/api/v1/devices",
                 params={"page[size]": "1"},
             )
-            if raw.get("data"):
-                first = raw["data"][0] if isinstance(raw["data"], list) else raw["data"]
-                _LOGGER.warning(
-                    "PROBE device top-level keys: %s", list(first.keys())
-                )
-                if "relationships" in first:
-                    _LOGGER.warning(
-                        "PROBE device relationships: %s",
-                        json.dumps(first["relationships"], indent=2, default=str),
-                    )
-                if "attributes" in first:
-                    _LOGGER.warning(
-                        "PROBE device attribute keys: %s",
-                        list(first["attributes"].keys()),
-                    )
-                device_id = first.get("id", "")
-            else:
+            if not raw.get("data"):
                 _LOGGER.warning("PROBE: /api/v1/devices returned no data")
                 return
+
+            first = raw["data"][0] if isinstance(raw["data"], list) else raw["data"]
+            device_id = first.get("id", "")
+
+            # Log each relationship name and its links
+            rels = first.get("relationships", {})
+            _LOGGER.warning(
+                "PROBE device relationship names: %s", list(rels.keys())
+            )
+            for rel_name, rel_data in rels.items():
+                links = rel_data.get("links", {})
+                _LOGGER.warning(
+                    "PROBE relationship '%s' links: %s", rel_name, links
+                )
+
         except Exception as err:
             _LOGGER.warning("PROBE devices failed: %s", err)
             return
 
-        # 2) Try several zone endpoint patterns
-        zone_paths = [
-            f"/api/v1/devices/{device_id}/zones",
-            f"/api/v1/devices/{device_id}/device-zones",
-            f"/api/v1/device-zones",
-            f"/api/v1/zones",
-        ]
-        for path in zone_paths:
+        # 2) Follow each relationship link that might contain zones
+        for rel_name, rel_data in rels.items():
+            links = rel_data.get("links", {})
+            related_url = links.get("related") or links.get("self")
+            if not related_url:
+                continue
+            # Only probe relationships that might be zone-related
             try:
                 raw = await raw_request(
-                    "GET", path,
-                    params={"page[size]": "5"},
+                    "GET", related_url,
+                    params={"page[size]": "3"},
                 )
                 data = raw.get("data", [])
                 count = len(data) if isinstance(data, list) else (1 if data else 0)
-                _LOGGER.warning("PROBE %s => %d items", path, count)
+                _LOGGER.warning(
+                    "PROBE rel '%s' (%s) => %d items", rel_name, related_url, count
+                )
                 if data:
-                    first_zone = data[0] if isinstance(data, list) else data
+                    item = data[0] if isinstance(data, list) else data
+                    attr_keys = list(item.get("attributes", {}).keys())
                     _LOGGER.warning(
-                        "PROBE %s first item keys: %s", path, list(first_zone.keys())
+                        "PROBE rel '%s' type=%s, attribute keys: %s",
+                        rel_name,
+                        item.get("type", "?"),
+                        attr_keys,
                     )
-                    if "attributes" in first_zone:
+                    # If this looks zone-like, dump the first item
+                    if any(k in attr_keys for k in ("zoneIndex", "zoneName", "zoneStatus")):
                         _LOGGER.warning(
-                            "PROBE %s attribute keys: %s",
-                            path,
-                            list(first_zone["attributes"].keys()),
+                            "PROBE rel '%s' ZONE DATA: %s",
+                            rel_name,
+                            json.dumps(item, indent=2, default=str),
                         )
-                        _LOGGER.warning(
-                            "PROBE %s first item attributes: %s",
-                            path,
-                            json.dumps(first_zone["attributes"], indent=2, default=str),
-                        )
-                    break  # Found a working endpoint
             except Exception as err:
-                _LOGGER.warning("PROBE %s => FAILED: %s", path, err)
+                _LOGGER.warning(
+                    "PROBE rel '%s' (%s) => FAILED: %s", rel_name, related_url, err
+                )
 
-        # 3) Log the notification zones endpoint structure too
+        # 3) Notification zones for comparison
         try:
             raw = await raw_request(
                 "GET", "/api/v1/events/notifications/zones",
                 params={"page[size]": "5"},
             )
             data = raw.get("data", [])
-            count = len(data) if isinstance(data, list) else 0
-            _LOGGER.warning("PROBE /api/v1/events/notifications/zones => %d items", count)
+            _LOGGER.warning(
+                "PROBE notification zones => %d items, keys: %s",
+                len(data) if isinstance(data, list) else 0,
+                list(data[0].get("attributes", {}).keys()) if data else [],
+            )
+            # Dump the full first notification zone for comparison
             if data:
                 _LOGGER.warning(
-                    "PROBE notification zone attribute keys: %s",
-                    list(data[0].get("attributes", {}).keys()),
+                    "PROBE notification zone full: %s",
+                    json.dumps(data[0], indent=2, default=str),
                 )
         except Exception as err:
             _LOGGER.warning("PROBE notification zones => FAILED: %s", err)
 
         _LOGGER.warning("=== END ALULA API PROBE ===")
-
-    # ──────────────────────────────────────────────────────────────────
-
-    async def _async_fetch_zones(self, panel_ids: list[str]) -> list[Zone]:
-        """Fetch zones, preferring per-device endpoint, falling back to notifications."""
-        all_zones: list[Zone] = []
-
-        # Try the per-device zones endpoint first (returns all zones).
-        for panel_id in panel_ids:
-            try:
-                device_zones = await self.client.async_get_device_zones(panel_id)
-                all_zones.extend(device_zones)
-                _LOGGER.debug(
-                    "Got %d zones from device endpoint for %s",
-                    len(device_zones),
-                    panel_id,
-                )
-            except (AlulaApiError, AlulaConnectionError) as err:
-                _LOGGER.debug(
-                    "Device zones endpoint failed for %s (%s), "
-                    "will fall back to notification zones",
-                    panel_id,
-                    err,
-                )
-                all_zones = []
-                break
-
-        if all_zones:
-            return all_zones
-
-        # Fallback: notification zones (only returns push-enabled zones).
-        _LOGGER.debug("Using notification zones endpoint as fallback")
-        try:
-            await self.client.async_renew_notifications()
-        except (AlulaApiError, AlulaConnectionError) as err:
-            _LOGGER.warning("Failed to renew notifications: %s", err)
-
-        return await self.client.async_get_zones()
