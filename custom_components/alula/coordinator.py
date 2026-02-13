@@ -45,7 +45,6 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Alula API."""
         try:
-            # One-time API probe to discover available endpoints/structure
             if not self._probed:
                 await self._async_probe_api()
                 self._probed = True
@@ -80,7 +79,7 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     [d.device_type for d in devices],
                 )
 
-            # Fetch zones via the notification endpoint (only source available)
+            # Fetch zones via the notification endpoint
             try:
                 await self.client.async_renew_notifications()
             except (AlulaApiError, AlulaConnectionError) as err:
@@ -115,96 +114,122 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ──────────────────────────────────────────────────────────────────
 
     async def _async_probe_api(self) -> None:
-        """One-time probe to log API structure for debugging."""
+        """One-time probe to find zone configuration data."""
         raw_request = self.client._request  # noqa: SLF001
+        rpc = self.client._rpc  # noqa: SLF001
 
-        _LOGGER.warning("=== ALULA API PROBE (one-time) ===")
+        _LOGGER.warning("=== ALULA API PROBE v3 ===")
 
-        # 1) Fetch device with relationships
+        # 1) Get ALL devices and find panels
         try:
             raw = await raw_request(
                 "GET", "/api/v1/devices",
-                params={"page[size]": "1"},
+                params={"page[size]": "10"},
             )
-            if not raw.get("data"):
-                _LOGGER.warning("PROBE: /api/v1/devices returned no data")
-                return
-
-            first = raw["data"][0] if isinstance(raw["data"], list) else raw["data"]
-            device_id = first.get("id", "")
-
-            # Log each relationship name and its links
-            rels = first.get("relationships", {})
-            _LOGGER.warning(
-                "PROBE device relationship names: %s", list(rels.keys())
-            )
-            for rel_name, rel_data in rels.items():
-                links = rel_data.get("links", {})
+            devices = raw.get("data", [])
+            _LOGGER.warning("PROBE: %d total devices", len(devices))
+            for d in devices:
+                attrs = d.get("attributes", {})
                 _LOGGER.warning(
-                    "PROBE relationship '%s' links: %s", rel_name, links
+                    "PROBE device id=%s name=%s isPanel=%s isCamera=%s",
+                    d.get("id"),
+                    attrs.get("friendlyName"),
+                    attrs.get("isPanel"),
+                    attrs.get("isCamera"),
                 )
+
+            # Find the panel device
+            panel = None
+            for d in devices:
+                if d.get("attributes", {}).get("isPanel"):
+                    panel = d
+                    break
+            if not panel:
+                _LOGGER.warning("PROBE: no panel device found")
+                return
+            panel_id = panel["id"]
+            panel_attrs = panel.get("attributes", {})
 
         except Exception as err:
             _LOGGER.warning("PROBE devices failed: %s", err)
             return
 
-        # 2) Follow each relationship link that might contain zones
-        for rel_name, rel_data in rels.items():
-            links = rel_data.get("links", {})
-            related_url = links.get("related") or links.get("self")
-            if not related_url:
-                continue
-            # Only probe relationships that might be zone-related
-            try:
-                raw = await raw_request(
-                    "GET", related_url,
-                    params={"page[size]": "3"},
-                )
-                data = raw.get("data", [])
-                count = len(data) if isinstance(data, list) else (1 if data else 0)
+        # 2) Check uiSettings for zone configuration
+        ui_settings = panel_attrs.get("uiSettings")
+        if ui_settings:
+            if isinstance(ui_settings, dict):
                 _LOGGER.warning(
-                    "PROBE rel '%s' (%s) => %d items", rel_name, related_url, count
+                    "PROBE uiSettings keys: %s", list(ui_settings.keys())
                 )
-                if data:
-                    item = data[0] if isinstance(data, list) else data
-                    attr_keys = list(item.get("attributes", {}).keys())
+                # Look for zone config inside uiSettings
+                zone_cfg = ui_settings.get("zoneConfiguration") or ui_settings.get("zones")
+                if zone_cfg:
                     _LOGGER.warning(
-                        "PROBE rel '%s' type=%s, attribute keys: %s",
-                        rel_name,
-                        item.get("type", "?"),
-                        attr_keys,
+                        "PROBE uiSettings.zoneConfiguration: %s",
+                        json.dumps(zone_cfg, indent=2, default=str)[:3000],
                     )
-                    # If this looks zone-like, dump the first item
-                    if any(k in attr_keys for k in ("zoneIndex", "zoneName", "zoneStatus")):
-                        _LOGGER.warning(
-                            "PROBE rel '%s' ZONE DATA: %s",
-                            rel_name,
-                            json.dumps(item, indent=2, default=str),
-                        )
-            except Exception as err:
+                else:
+                    # Dump first 3000 chars of uiSettings
+                    _LOGGER.warning(
+                        "PROBE uiSettings (no zoneConfiguration key): %s",
+                        json.dumps(ui_settings, indent=2, default=str)[:3000],
+                    )
+            else:
                 _LOGGER.warning(
-                    "PROBE rel '%s' (%s) => FAILED: %s", rel_name, related_url, err
+                    "PROBE uiSettings type=%s value=%s",
+                    type(ui_settings).__name__,
+                    str(ui_settings)[:2000],
                 )
+        else:
+            _LOGGER.warning("PROBE uiSettings: empty/missing")
 
-        # 3) Notification zones for comparison
+        # 3) Check capabilities
+        capabilities = panel_attrs.get("capabilities")
+        if capabilities:
+            _LOGGER.warning(
+                "PROBE capabilities: %s",
+                json.dumps(capabilities, indent=2, default=str)[:3000],
+            )
+        else:
+            _LOGGER.warning("PROBE capabilities: empty/missing")
+
+        # 4) Try RPC methods for zone configuration
+        rpc_methods = [
+            ("helix.getZoneConfiguration", {"deviceId": panel_id}),
+            ("helix.getConfiguration", {"deviceId": panel_id}),
+            ("helix.zones", {"deviceId": panel_id}),
+            ("device.getZoneConfiguration", {"deviceId": panel_id}),
+            ("events.notifications.zones", {"deviceId": panel_id}),
+        ]
+        for method, params in rpc_methods:
+            try:
+                result = await rpc(method, params)
+                _LOGGER.warning(
+                    "PROBE RPC %s => %s",
+                    method,
+                    json.dumps(result, indent=2, default=str)[:3000],
+                )
+            except Exception as err:
+                _LOGGER.warning("PROBE RPC %s => FAILED: %s", method, err)
+
+        # 5) Try fetching device with include parameter
         try:
             raw = await raw_request(
-                "GET", "/api/v1/events/notifications/zones",
-                params={"page[size]": "5"},
+                "GET", f"/api/v1/devices/{panel_id}",
+                params={"include": "notifications"},
             )
-            data = raw.get("data", [])
+            included = raw.get("included", [])
             _LOGGER.warning(
-                "PROBE notification zones => %d items, keys: %s",
-                len(data) if isinstance(data, list) else 0,
-                list(data[0].get("attributes", {}).keys()) if data else [],
+                "PROBE device?include=notifications => %d included items", len(included)
             )
-            # Dump the full first notification zone for comparison
-            if data:
+            if included:
+                first = included[0]
                 _LOGGER.warning(
-                    "PROBE notification zone full: %s",
-                    json.dumps(data[0], indent=2, default=str),
+                    "PROBE included type=%s keys=%s",
+                    first.get("type"),
+                    list(first.get("attributes", {}).keys()),
                 )
         except Exception as err:
-            _LOGGER.warning("PROBE notification zones => FAILED: %s", err)
+            _LOGGER.warning("PROBE include=notifications => FAILED: %s", err)
 
-        _LOGGER.warning("=== END ALULA API PROBE ===")
+        _LOGGER.warning("=== END ALULA API PROBE v3 ===")
