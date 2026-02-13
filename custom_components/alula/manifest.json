@@ -1,0 +1,13 @@
+{
+  "domain": "alula",
+  "name": "Alula / Cove Security",
+  "codeowners": ["@joshuaseidel"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/joshuaseidel/alula-ha",
+  "homeassistant": "2026.2.0",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/joshuaseidel/alula-ha/issues",
+  "requirements": ["alulapy==0.1.0"],
+  "version": "0.1.0"
+}

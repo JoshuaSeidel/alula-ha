@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Cove / Alula Security",
+        "description": "Enter your Cove Connect app credentials.",
+        "data": {
+          "username": "Username",
+          "password": "PIN / Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or PIN.",
+      "cannot_connect": "Unable to connect to Alula servers."
+    },
+    "abort": {
+      "already_configured": "This account is already configured."
+    }
+  }
+}
