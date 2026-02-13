@@ -55,6 +55,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = AlulaDataUpdateCoordinator(hass, client, entry)
     await coordinator.async_config_entry_first_refresh()
 
+    data = coordinator.data or {}
+    _LOGGER.debug(
+        "First refresh complete — panels: %d, cameras: %d, zone groups: %d",
+        len(data.get("panels", {})),
+        len(data.get("cameras", {})),
+        len(data.get("zones", {})),
+    )
+
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
