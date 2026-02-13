@@ -97,4 +97,9 @@ class AlulaZoneSensor(
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return {"zone_index": self._zone_index}
+        zone = self._zone
+        return {
+            "zone_index": self._zone_index,
+            "zone_name": zone.zone_name if zone else None,
+            "device_type_hint": zone.device_type_hint if zone else None,
+        }

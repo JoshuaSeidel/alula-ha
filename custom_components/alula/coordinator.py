@@ -37,33 +37,15 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.config_entry = config_entry
-        self._notif_renewed = False
+
+    # ──────────────────────────────────────────────────────────────────
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Alula API."""
         try:
-            # Ensure notification subscriptions are active so the zones
-            # endpoint returns data.  Only needs to succeed once per session.
-            if not self._notif_renewed:
-                try:
-                    await self.client.async_renew_notifications()
-                    self._notif_renewed = True
-                    _LOGGER.debug("Notification subscription renewed")
-                except (AlulaApiError, AlulaConnectionError) as err:
-                    _LOGGER.warning(
-                        "Failed to renew notification subscription "
-                        "(zones may be empty): %s",
-                        err,
-                    )
-
             devices = await self.client.async_get_devices()
-            zones = await self.client.async_get_zones()
 
-            _LOGGER.debug(
-                "API returned %d devices and %d zones",
-                len(devices),
-                len(zones),
-            )
+            _LOGGER.debug("API returned %d devices", len(devices))
 
             if not devices:
                 _LOGGER.warning(
@@ -92,16 +74,22 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     [d.device_type for d in devices],
                 )
 
-            # Group zones by device_id -> zone_index (last wins for duplicates)
+            # Fetch zones per panel via the device relationship endpoint
+            # which returns ALL zones (not just notification-enabled ones).
+            # Falls back to the notification zones endpoint if it fails.
+            zones = await self._async_fetch_zones(list(panels.keys()))
+
+            # Group zones by device_id -> zone_index
             zone_map: dict[str, dict[int, Zone]] = {}
             for zone in zones:
                 zone_map.setdefault(zone.device_id, {})[zone.zone_index] = zone
 
             _LOGGER.debug(
-                "Processed: %d panels, %d cameras, %d zone groups",
+                "Processed: %d panels, %d cameras, %d zone groups (%d total zones)",
                 len(panels),
                 len(cameras),
                 len(zone_map),
+                len(zones),
             )
 
             return {
@@ -114,3 +102,41 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"Authentication error: {err}") from err
         except (AlulaApiError, AlulaConnectionError) as err:
             raise UpdateFailed(f"API error: {err}") from err
+
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _async_fetch_zones(self, panel_ids: list[str]) -> list[Zone]:
+        """Fetch zones, preferring per-device endpoint, falling back to notifications."""
+        all_zones: list[Zone] = []
+
+        # Try the per-device zones endpoint first (returns all zones).
+        for panel_id in panel_ids:
+            try:
+                device_zones = await self.client.async_get_device_zones(panel_id)
+                all_zones.extend(device_zones)
+                _LOGGER.debug(
+                    "Got %d zones from device endpoint for %s",
+                    len(device_zones),
+                    panel_id,
+                )
+            except (AlulaApiError, AlulaConnectionError) as err:
+                _LOGGER.debug(
+                    "Device zones endpoint failed for %s (%s), "
+                    "will fall back to notification zones",
+                    panel_id,
+                    err,
+                )
+                all_zones = []
+                break
+
+        if all_zones:
+            return all_zones
+
+        # Fallback: notification zones (only returns push-enabled zones).
+        _LOGGER.debug("Using notification zones endpoint as fallback")
+        try:
+            await self.client.async_renew_notifications()
+        except (AlulaApiError, AlulaConnectionError) as err:
+            _LOGGER.warning("Failed to renew notifications: %s", err)
+
+        return await self.client.async_get_zones()
