@@ -111,11 +111,15 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_probe_api(self) -> None:
         """One-time probe to log API structure for debugging."""
+        # Access the client's internal _request to make raw API calls
+        # without needing a newer alulapy version.
+        raw_request = self.client._request  # noqa: SLF001
+
         _LOGGER.warning("=== ALULA API PROBE (one-time) ===")
 
         # 1) Fetch a device WITH relationships to see what links exist
         try:
-            raw = await self.client.async_request_raw(
+            raw = await raw_request(
                 "GET", "/api/v1/devices",
                 params={"page[size]": "1"},
             )
@@ -151,7 +155,7 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ]
         for path in zone_paths:
             try:
-                raw = await self.client.async_request_raw(
+                raw = await raw_request(
                     "GET", path,
                     params={"page[size]": "5"},
                 )
@@ -180,7 +184,7 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # 3) Log the notification zones endpoint structure too
         try:
-            raw = await self.client.async_request_raw(
+            raw = await raw_request(
                 "GET", "/api/v1/events/notifications/zones",
                 params={"page[size]": "5"},
             )
