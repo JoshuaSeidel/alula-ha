@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import timedelta
-import json
 import logging
 from typing import Any
 
@@ -12,15 +11,40 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from alulapy import AlulaClient, AlulaApiError, AlulaAuthError, AlulaConnectionError
-from alulapy.models import Device, Zone
+from alulapy.models import Zone, ZoneStatus
 
 from .const import CONF_REFRESH_TOKEN, DOMAIN, UPDATE_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
+# Zone types from the event log that represent physical sensors.
+# "User" type entries are user codes (e.g., "Joshua", "Entry Way") not sensors.
+_SENSOR_ZONE_TYPES = {"Zone", "Fire", ""}
+
+# How often (in polls) to do a deep event log scan for new zones.
+# At 30s poll interval, 20 polls = ~10 minutes.
+_DEEP_SCAN_INTERVAL = 20
+
+
+def _filter_sensor_zones(
+    raw_zones: dict[int, dict[str, str | None]],
+) -> dict[int, dict[str, str | None]]:
+    """Filter out non-sensor zones (e.g., user codes)."""
+    return {
+        idx: info
+        for idx, info in raw_zones.items()
+        if (info.get("zone_type") or "") in _SENSOR_ZONE_TYPES
+    }
+
 
 class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator that polls the Alula API."""
+    """Coordinator that polls the Alula API.
+
+    The Alula API has no standalone zone configuration endpoint. Zones are
+    discovered from event log entries as sensors trigger over time.  On each
+    poll we check for newly-seen zones and automatically create notification
+    subscriptions and HA entities for them.
+    """
 
     config_entry: ConfigEntry
 
@@ -38,25 +62,22 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.config_entry = config_entry
-        self._probed = False
+        self._zones_initialized = False
+        self._poll_count = 0
+        # zone_index -> {zone_name, zone_type} per panel
+        self._zone_metadata: dict[str, dict[int, dict[str, str | None]]] = {}
 
     # ──────────────────────────────────────────────────────────────────
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Alula API."""
         try:
-            if not self._probed:
-                await self._async_probe_api()
-                self._probed = True
-
             devices = await self.client.async_get_devices()
-
             _LOGGER.debug("API returned %d devices", len(devices))
 
             if not devices:
                 _LOGGER.warning(
-                    "Alula API returned 0 devices — no entities will be "
-                    "created. Verify the account has devices at "
+                    "Alula API returned 0 devices — verify the account at "
                     "https://app.cove.com"
                 )
 
@@ -72,32 +93,23 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             panels = {d.id: d for d in devices if d.is_panel}
             cameras = {d.id: d for d in devices if d.is_camera}
 
-            if devices and not panels:
-                _LOGGER.warning(
-                    "Found %d devices but none are panels. Device types: %s",
-                    len(devices),
-                    [d.device_type for d in devices],
-                )
+            # First run: deep scan event log and create subscriptions
+            if not self._zones_initialized:
+                await self._async_initialize_zones(panels)
+                self._zones_initialized = True
 
-            # Fetch zones via the notification endpoint
-            try:
-                await self.client.async_renew_notifications()
-            except (AlulaApiError, AlulaConnectionError) as err:
-                _LOGGER.warning("Failed to renew notifications: %s", err)
+            # Poll zone state from event log (also discovers new zones)
+            zone_map = await self._async_poll_zone_states(panels)
 
-            zones = await self.client.async_get_zones()
-
-            # Group zones by device_id -> zone_index
-            zone_map: dict[str, dict[int, Zone]] = {}
-            for zone in zones:
-                zone_map.setdefault(zone.device_id, {})[zone.zone_index] = zone
+            self._poll_count += 1
 
             _LOGGER.debug(
-                "Processed: %d panels, %d cameras, %d zone groups (%d total zones)",
+                "Poll #%d: %d panels, %d cameras, %d zone groups (%d zones)",
+                self._poll_count,
                 len(panels),
                 len(cameras),
                 len(zone_map),
-                len(zones),
+                sum(len(zs) for zs in zone_map.values()),
             )
 
             return {
@@ -113,123 +125,152 @@ class AlulaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # ──────────────────────────────────────────────────────────────────
 
-    async def _async_probe_api(self) -> None:
-        """One-time probe to find zone configuration data."""
-        raw_request = self.client._request  # noqa: SLF001
-        rpc = self.client._rpc  # noqa: SLF001
-
-        _LOGGER.warning("=== ALULA API PROBE v3 ===")
-
-        # 1) Get ALL devices and find panels
-        try:
-            raw = await raw_request(
-                "GET", "/api/v1/devices",
-                params={"page[size]": "10"},
+    async def _async_initialize_zones(self, panels: dict[str, Any]) -> None:
+        """Deep-scan event log for zones and create notification subscriptions."""
+        for panel_id in panels:
+            raw_zones = await self.client.async_discover_zones(panel_id)
+            zone_info = _filter_sensor_zones(raw_zones)
+            self._zone_metadata[panel_id] = zone_info
+            _LOGGER.info(
+                "Discovered %d sensor zones for panel %s: %s",
+                len(zone_info),
+                panel_id,
+                {idx: info.get("zone_name") for idx, info in zone_info.items()},
             )
-            devices = raw.get("data", [])
-            _LOGGER.warning("PROBE: %d total devices", len(devices))
-            for d in devices:
-                attrs = d.get("attributes", {})
-                _LOGGER.warning(
-                    "PROBE device id=%s name=%s isPanel=%s isCamera=%s",
-                    d.get("id"),
-                    attrs.get("friendlyName"),
-                    attrs.get("isPanel"),
-                    attrs.get("isCamera"),
+
+            if zone_info:
+                created = await self.client.async_ensure_zone_subscriptions(
+                    panel_id, list(zone_info.keys())
                 )
+                if created:
+                    _LOGGER.info("Created %d new zone subscriptions", created)
 
-            # Find the panel device
-            panel = None
-            for d in devices:
-                if d.get("attributes", {}).get("isPanel"):
-                    panel = d
-                    break
-            if not panel:
-                _LOGGER.warning("PROBE: no panel device found")
-                return
-            panel_id = panel["id"]
-            panel_attrs = panel.get("attributes", {})
+                try:
+                    await self.client.async_renew_notifications()
+                except (AlulaApiError, AlulaConnectionError) as err:
+                    _LOGGER.warning("Failed to renew notifications: %s", err)
 
-        except Exception as err:
-            _LOGGER.warning("PROBE devices failed: %s", err)
-            return
+    # ──────────────────────────────────────────────────────────────────
 
-        # 2) Check uiSettings for zone configuration
-        ui_settings = panel_attrs.get("uiSettings")
-        if ui_settings:
-            if isinstance(ui_settings, dict):
-                _LOGGER.warning(
-                    "PROBE uiSettings keys: %s", list(ui_settings.keys())
+    async def _async_poll_zone_states(
+        self, panels: dict[str, Any]
+    ) -> dict[str, dict[int, Zone]]:
+        """Determine current zone states from event log entries.
+
+        Also discovers new zones from every batch of events.  Periodically
+        does a deeper scan (500 events) to catch zones with infrequent
+        activity.
+        """
+        # Periodically do a deep scan to discover zones with rare events
+        deep_scan = (self._poll_count % _DEEP_SCAN_INTERVAL == 0)
+        event_limit = 500 if deep_scan else 100
+
+        zone_map: dict[str, dict[int, Zone]] = {}
+
+        for panel_id in panels:
+            metadata = self._zone_metadata.setdefault(panel_id, {})
+
+            events = await self.client.async_get_event_log(
+                panel_id, limit=event_limit
+            )
+
+            # Discover new zones from events
+            new_zones = self._discover_new_zones(panel_id, events)
+            if new_zones:
+                _LOGGER.info(
+                    "Discovered %d new zone(s) from event log: %s",
+                    len(new_zones),
+                    {idx: info.get("zone_name") for idx, info in new_zones.items()},
                 )
-                # Look for zone config inside uiSettings
-                zone_cfg = ui_settings.get("zoneConfiguration") or ui_settings.get("zones")
-                if zone_cfg:
-                    _LOGGER.warning(
-                        "PROBE uiSettings.zoneConfiguration: %s",
-                        json.dumps(zone_cfg, indent=2, default=str)[:3000],
+                # Create subscriptions for new zones
+                try:
+                    created = await self.client.async_ensure_zone_subscriptions(
+                        panel_id, list(new_zones.keys())
                     )
-                else:
-                    # Dump first 3000 chars of uiSettings
+                    if created:
+                        _LOGGER.info(
+                            "Created %d subscriptions for new zones", created
+                        )
+                except (AlulaApiError, AlulaConnectionError) as err:
                     _LOGGER.warning(
-                        "PROBE uiSettings (no zoneConfiguration key): %s",
-                        json.dumps(ui_settings, indent=2, default=str)[:3000],
+                        "Failed to create subscriptions for new zones: %s", err
                     )
-            else:
-                _LOGGER.warning(
-                    "PROBE uiSettings type=%s value=%s",
-                    type(ui_settings).__name__,
-                    str(ui_settings)[:2000],
+
+            # Build zone states from most recent event per zone
+            zone_states: dict[int, Zone] = {}
+            for event in events:  # sorted newest-first
+                if not event.user_zone or not event.user_zone.isdigit():
+                    continue
+                zone_idx = int(event.user_zone)
+                if zone_idx == 0 or zone_idx in zone_states:
+                    continue
+                # Only process zones we've accepted as sensors
+                if zone_idx not in metadata:
+                    continue
+
+                # Contact ID qualifier: "1" = new event/open, "3" = restore/close
+                is_open = event.event_qualifier == "1"
+
+                meta = metadata.get(zone_idx, {})
+                zone_name = meta.get("zone_name") or event.user_zone_alias
+                zone_type = meta.get("zone_type") or event.user_zone_type
+
+                zone_states[zone_idx] = Zone(
+                    id=f"{panel_id}_zone_{zone_idx}",
+                    device_id=panel_id,
+                    zone_index=zone_idx,
+                    status=ZoneStatus(name="open", is_active=is_open),
+                    push_enabled=True,
+                    zone_name=zone_name,
+                    device_type_hint=zone_type,
+                    raw={},
                 )
-        else:
-            _LOGGER.warning("PROBE uiSettings: empty/missing")
 
-        # 3) Check capabilities
-        capabilities = panel_attrs.get("capabilities")
-        if capabilities:
-            _LOGGER.warning(
-                "PROBE capabilities: %s",
-                json.dumps(capabilities, indent=2, default=str)[:3000],
-            )
-        else:
-            _LOGGER.warning("PROBE capabilities: empty/missing")
+            # Include all known zones, defaulting to closed if no recent event
+            for zone_idx, meta in metadata.items():
+                if zone_idx not in zone_states:
+                    zone_states[zone_idx] = Zone(
+                        id=f"{panel_id}_zone_{zone_idx}",
+                        device_id=panel_id,
+                        zone_index=zone_idx,
+                        status=ZoneStatus(name="open", is_active=False),
+                        push_enabled=True,
+                        zone_name=meta.get("zone_name"),
+                        device_type_hint=meta.get("zone_type"),
+                        raw={},
+                    )
 
-        # 4) Try RPC methods for zone configuration
-        rpc_methods = [
-            ("helix.getZoneConfiguration", {"deviceId": panel_id}),
-            ("helix.getConfiguration", {"deviceId": panel_id}),
-            ("helix.zones", {"deviceId": panel_id}),
-            ("device.getZoneConfiguration", {"deviceId": panel_id}),
-            ("events.notifications.zones", {"deviceId": panel_id}),
-        ]
-        for method, params in rpc_methods:
-            try:
-                result = await rpc(method, params)
-                _LOGGER.warning(
-                    "PROBE RPC %s => %s",
-                    method,
-                    json.dumps(result, indent=2, default=str)[:3000],
-                )
-            except Exception as err:
-                _LOGGER.warning("PROBE RPC %s => FAILED: %s", method, err)
+            zone_map[panel_id] = zone_states
 
-        # 5) Try fetching device with include parameter
-        try:
-            raw = await raw_request(
-                "GET", f"/api/v1/devices/{panel_id}",
-                params={"include": "notifications"},
-            )
-            included = raw.get("included", [])
-            _LOGGER.warning(
-                "PROBE device?include=notifications => %d included items", len(included)
-            )
-            if included:
-                first = included[0]
-                _LOGGER.warning(
-                    "PROBE included type=%s keys=%s",
-                    first.get("type"),
-                    list(first.get("attributes", {}).keys()),
-                )
-        except Exception as err:
-            _LOGGER.warning("PROBE include=notifications => FAILED: %s", err)
+        return zone_map
 
-        _LOGGER.warning("=== END ALULA API PROBE v3 ===")
+    # ──────────────────────────────────────────────────────────────────
+
+    def _discover_new_zones(
+        self, panel_id: str, events: list
+    ) -> dict[int, dict[str, str | None]]:
+        """Check events for zones not yet in our metadata. Returns new ones."""
+        metadata = self._zone_metadata.setdefault(panel_id, {})
+        new_zones: dict[int, dict[str, str | None]] = {}
+
+        for event in events:
+            if not event.user_zone or not event.user_zone.isdigit():
+                continue
+            zone_idx = int(event.user_zone)
+            if zone_idx == 0 or zone_idx in metadata or zone_idx in new_zones:
+                continue
+
+            zone_type = event.user_zone_type or ""
+            if zone_type not in _SENSOR_ZONE_TYPES:
+                continue
+
+            new_zones[zone_idx] = {
+                "zone_name": event.user_zone_alias,
+                "zone_type": zone_type,
+            }
+
+        # Merge into metadata
+        if new_zones:
+            metadata.update(new_zones)
+
+        return new_zones

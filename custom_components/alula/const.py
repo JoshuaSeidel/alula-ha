@@ -14,4 +14,4 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
 ]
 
-UPDATE_INTERVAL = 30  # seconds
+UPDATE_INTERVAL = 15  # seconds
